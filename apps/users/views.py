@@ -1,63 +1,211 @@
-from django.shortcuts import render, redirect
-from django.contrib.auth import login
-from django.contrib.auth.forms import AuthenticationForm
-from django.contrib import messages
-from .forms import UserRegistrationForm, UserProfileForm
-from django.contrib.auth.decorators import login_required
-from django.views.generic import CreateView, UpdateView, ListView, View, TemplateView
-from django.urls import reverse_lazy
-from django.contrib.auth.mixins import LoginRequiredMixin
-from .models import Privilege, UserPrivilege
+from decimal import Decimal
+from django.db.models import Sum
+from django.db.models.functions import Coalesce
 
-class UserRegisterView(CreateView):
-    form_class = UserRegistrationForm
-    template_name = 'users/register.html'
-    success_url = reverse_lazy('profile')
+from rest_framework.views import APIView
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
+from rest_framework.parsers import MultiPartParser, FormParser
 
-    def form_valid(self, form):
-        """Если форма валидна, сохраняем пользователя и логиним"""
-        user = form.save()
-        login(self.request, user)
-        messages.success(self.request, 'Вы успешно зарегистрированы!')
-        return redirect(self.success_url)
+from apps.users.models import UserProfile, UserPrivilege, Privilege
+from .serializers import (
+    RegisterSerializer, LoginSerializer,
+    UserSerializer, UserProfileSerializer,
+    ChangePasswordSerializer, LogoutSerializer,
+)
 
-class UserProfileView(LoginRequiredMixin, UpdateView):
-    form_class = UserProfileForm
-    template_name = 'users/profile.html'
-    success_url = reverse_lazy('profile')
 
-    def get_object(self, queryset=None):
-        """Получаем профиль текущего пользователя"""
-        return self.request.user.userprofile
+class PrivilegeListView(APIView):
+    permission_classes = [IsAuthenticated]
 
-    def form_valid(self, form):
-        """Если форма валидна, сохраняем изменения и показываем сообщение"""
-        messages.success(self.request, 'Профиль успешно обновлен!')
-        return super().form_valid(form)
+    def get(self, request):
+        qs = Privilege.objects.all().order_by("price", "id")
+        data = [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "price": str(p.price),
+                "created_at": p.created_at,
+            }
+            for p in qs
+        ]
+        return Response(data, status=status.HTTP_200_OK)
 
-class PrivilegeListView(LoginRequiredMixin, ListView):
-    model = Privilege
-    template_name = 'users/privilege_list.html'
-    context_object_name = 'privileges'
 
-class BuyPrivilegeView(LoginRequiredMixin, View):
-    def post(self, request, privilege_id):
-        privilege = Privilege.objects.get(id=privilege_id)
+class BuyPrivilegeView(APIView):
+    permission_classes = [IsAuthenticated]
 
-        if UserPrivilege.objects.filter(user=request.user, privilege=privilege).exists():
-            messages.warning(request, 'Вы уже купили эту привилегию.')
-            return redirect('privilege_list')
+    def post(self, request, privilege_id: int):
+        privilege = Privilege.objects.filter(id=privilege_id).first()
+        if not privilege:
+            return Response({"detail": "Привилегия не найдена."}, status=status.HTTP_404_NOT_FOUND)
 
-        UserPrivilege.objects.create(user=request.user, privilege=privilege)
-        messages.success(request, f'Вы успешно купили привилегию "{privilege.name}".')
+        obj, created = UserPrivilege.objects.get_or_create(user=request.user, privilege=privilege)
+        if not created:
+            return Response({"detail": "Вы уже купили эту привилегию."}, status=status.HTTP_200_OK)
 
-        return redirect('privilege_list')
+        return Response({"detail": "Куплено успешно."}, status=status.HTTP_201_CREATED)
 
-class UserProfileWithPrivilegesView(LoginRequiredMixin, TemplateView):
-    template_name = 'users/profile.html'
 
-    def get_context_data(self, **kwargs):
-        context = super().get_context_data(**kwargs)
-        context['user_privileges'] = UserPrivilege.objects.filter(user=self.request.user)
-        return context
-    
+class MyPrivilegesView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        qs = (
+            UserPrivilege.objects
+            .filter(user=request.user)
+            .select_related("privilege")
+            .order_by("-purchased_at")
+        )
+        data = [
+            {
+                "id": up.id,
+                "privilege_id": up.privilege_id,
+                "name": up.privilege.name,
+                "description": up.privilege.description,
+                "price": str(up.privilege.price),
+                "purchased_at": up.purchased_at,
+            }
+            for up in qs
+        ]
+        return Response(data, status=status.HTTP_200_OK)
+
+class ProfileStatsMixin:
+    def get_profile(self, user):
+        profile, _ = UserProfile.objects.get_or_create(user=user)
+        return profile
+
+    def is_premium(self, user) -> bool:
+        # Можно ужесточить: privilege__code="premium", если добавишь code
+        return UserPrivilege.objects.filter(user=user).exists()
+
+    def calc_money_stats(self, user):
+        # берем из apps.management Transaction
+        from apps.management.models import Transaction
+
+        income = Transaction.objects.filter(user=user, type=Transaction.INCOME).aggregate(
+            s=Coalesce(Sum("amount"), Decimal("0"))
+        )["s"]
+        expense = Transaction.objects.filter(user=user, type=Transaction.EXPENSE).aggregate(
+            s=Coalesce(Sum("amount"), Decimal("0"))
+        )["s"]
+        balance = income - expense
+
+        operations_count = Transaction.objects.filter(user=user).count()
+
+        economy_percent = 0
+        if income > 0:
+            economy_percent = int(((income - expense) / income) * 100)
+            if economy_percent < 0:
+                economy_percent = 0
+            if economy_percent > 100:
+                economy_percent = 100
+
+        return {
+            "balance": str(balance),
+            "income_total": str(income),
+            "expense_total": str(expense),
+            "economy_percent": economy_percent,
+            "operations_count": operations_count,
+        }
+
+
+class RegisterView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        ser = RegisterSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        user = ser.save()
+        return Response({"detail": "OK", "user_id": user.id}, status=status.HTTP_201_CREATED)
+
+
+class LoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        ser = LoginSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        return Response(ser.validated_data, status=status.HTTP_200_OK)
+
+
+class LogoutView(APIView):
+    """
+    POST /auth/logout/  { "refresh": "..." }
+    (Работает если подключен token_blacklist)
+    """
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ser = LogoutSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        ser.save()
+        return Response({"detail": "OK"}, status=status.HTTP_200_OK)
+
+
+class MeView(ProfileStatsMixin, APIView):
+    """
+    GET  /me/      -> профиль + статистика (как на экране)
+    PATCH /me/     -> обновить user/profile
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser]
+
+    def get(self, request):
+        profile = self.get_profile(request.user)
+
+        stats = self.calc_money_stats(request.user)
+        premium = self.is_premium(request.user)
+
+        return Response({
+            "user": UserSerializer(request.user).data,
+            "profile": UserProfileSerializer(profile, context={"request": request}).data,
+            "is_premium": premium,
+            "stats": {
+                "goals_achieved": profile.goals_achieved,
+                "saving_days": profile.saving_days,
+                **stats,
+            }
+        })
+
+    def patch(self, request):
+        profile = self.get_profile(request.user)
+
+        # Можно присылать одним объектом:
+        # { "user": {...}, "profile": {...} }
+        user_data = request.data.get("user", {})
+        profile_data = request.data.get("profile", {})
+
+        user_ser = UserSerializer(request.user, data=user_data, partial=True)
+        prof_ser = UserProfileSerializer(profile, data=profile_data, partial=True, context={"request": request})
+
+        user_ser.is_valid(raise_exception=True)
+        prof_ser.is_valid(raise_exception=True)
+
+        user_ser.save()
+        prof_ser.save()
+
+        return Response({
+            "user": user_ser.data,
+            "profile": prof_ser.data
+        }, status=status.HTTP_200_OK)
+
+
+class ChangePasswordView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        ser = ChangePasswordSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+
+        old_password = ser.validated_data["old_password"]
+        new_password = ser.validated_data["new_password"]
+
+        if not request.user.check_password(old_password):
+            return Response({"detail": "Старый пароль неверный"}, status=status.HTTP_400_BAD_REQUEST)
+
+        request.user.set_password(new_password)
+        request.user.save(update_fields=["password"])
+        return Response({"detail": "Пароль обновлён"}, status=status.HTTP_200_OK)

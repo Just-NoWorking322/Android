@@ -1,89 +1,102 @@
 from django.db import models
-from django.contrib.auth.models import AbstractBaseUser, BaseUserManager
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.core.validators import EmailValidator
 
 
 class UserManager(BaseUserManager):
-    """Менеджер для модели User"""
-    def create_user(self, email, phone_number, password=None):
+    def create_user(self, email, phone_number, password=None, **extra_fields):
         if not email:
             raise ValueError("Email обязателен")
         if not phone_number:
             raise ValueError("Номер телефона обязателен")
 
         email = self.normalize_email(email)
-        user = self.model(email=email, phone_number=phone_number)
-        user.set_password(password)  # Устанавливаем пароль в хешированном виде
+        user = self.model(email=email, phone_number=phone_number, **extra_fields)
+
+        if password:
+            user.set_password(password)
+        else:
+            user.set_unusable_password()
+
         user.save(using=self._db)
         return user
 
-    def create_superuser(self, email, phone_number, password=None):
-        """Создание суперпользователя"""
-        user = self.create_user(email, phone_number, password)
-        user.is_admin = True
-        user.save(using=self._db)
+    def create_superuser(self, email, phone_number, password=None, **extra_fields):
+        if not password:
+            raise ValueError("Пароль обязателен для суперпользователя")
+
+        extra_fields.setdefault("is_active", True)
+        extra_fields.setdefault("is_staff", True)
+        extra_fields.setdefault("is_superuser", True)
+
+        user = self.create_user(email, phone_number, password=password, **extra_fields)
         return user
 
 
-class User(AbstractBaseUser):
-    """Модель пользователя"""
-    email = models.EmailField(unique=True, validators=[EmailValidator()])
-    phone_number = models.CharField(max_length=15, unique=True)
-    first_name = models.CharField(max_length=50, blank=True)
-    last_name = models.CharField(max_length=50, blank=True)
-    is_active = models.BooleanField(default=True)
-    is_admin = models.BooleanField(default=False)
+class User(AbstractBaseUser, PermissionsMixin):
+    email = models.EmailField(
+        unique=True,
+        validators=[EmailValidator()],
+        verbose_name="Email",
+    )
+    phone_number = models.CharField(
+        max_length=15,
+        unique=True,
+        verbose_name="Номер телефона",
+    )
+    first_name = models.CharField(max_length=50, blank=True, verbose_name="Имя")
+    last_name = models.CharField(max_length=50, blank=True, verbose_name="Фамилия")
 
-    # Свойства для управления сессиями
-    USERNAME_FIELD = 'email'
-    REQUIRED_FIELDS = ['phone_number', 'password']
+    is_active = models.BooleanField(default=True, verbose_name="Активен")
+    is_staff = models.BooleanField(default=False, verbose_name="Доступ в админку")
+
+    USERNAME_FIELD = "email"
+    REQUIRED_FIELDS = ["phone_number"]
 
     objects = UserManager()
 
     def __str__(self):
         return self.email
 
-    def has_perm(self, perm, obj=None):
-        return True
-
-    def has_module_perms(self, app_label):
-        return True
-
-    @property
-    def is_staff(self):
-        return self.is_admin
-
-
 class UserProfile(models.Model):
-    """Профиль пользователя"""
-    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name="profile")
     bio = models.TextField(blank=True, null=True)
-    avatar = models.ImageField(upload_to='avatars/', blank=True, null=True)
+    avatar = models.ImageField(upload_to="avatars/", blank=True, null=True)
     date_of_birth = models.DateField(null=True, blank=True)
+
+    # для профиля (карточки)
+    goals_achieved = models.PositiveIntegerField(default=0)   # "Цель достигнута"
+    saving_days = models.PositiveIntegerField(default=0)      # "Дней экономии"
+
+    # настройки экрана (по желанию, но удобно)
+    notifications_enabled = models.BooleanField(default=True)
+    theme = models.CharField(max_length=10, default="system")  # light/dark/system
+    language = models.CharField(max_length=5, default="ru")    # ru/ky/en
 
     def __str__(self):
         return f"Profile of {self.user.email}"
 
-
 class Privilege(models.Model):
-    """Модель привилегий"""
-    name = models.CharField(max_length=100)
-    description = models.TextField()
-    price = models.DecimalField(max_digits=10, decimal_places=2)  # Цена привилегии
-    created_at = models.DateTimeField(auto_now_add=True)
+    name = models.CharField(max_length=100, verbose_name="Название")
+    description = models.TextField(verbose_name="Описание")
+    price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name="Цена")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
 
     def __str__(self):
         return self.name
 
 
 class UserPrivilege(models.Model):
-    """Модель привилегий пользователя"""
-    user = models.ForeignKey(User, on_delete=models.CASCADE)
-    privilege = models.ForeignKey(Privilege, on_delete=models.CASCADE)
-    purchased_at = models.DateTimeField(auto_now_add=True)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, verbose_name="Пользователь")
+    privilege = models.ForeignKey(Privilege, on_delete=models.CASCADE, verbose_name="Привилегия")
+    purchased_at = models.DateTimeField(auto_now_add=True, verbose_name="Куплено")
 
     class Meta:
-        unique_together = ('user', 'privilege')  # Одинаковая привилегия не может быть куплена дважды
+        constraints = [
+            models.UniqueConstraint(fields=["user", "privilege"], name="uniq_user_privilege")
+        ]
+        verbose_name = "Привилегия пользователя"
+        verbose_name_plural = "Привилегии пользователей"
 
     def __str__(self):
         return f"{self.user.email} - {self.privilege.name}"
